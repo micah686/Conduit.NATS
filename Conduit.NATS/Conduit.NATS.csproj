@@ -12,6 +12,10 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <InternalsVisibleTo Include="Conduit.NATS.UnitTests" />
+    </ItemGroup>
+
+    <ItemGroup>
         <PackageReference Include="NATS.Net" Version="3.0.0-preview.10" />
         <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.9" />
         <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />

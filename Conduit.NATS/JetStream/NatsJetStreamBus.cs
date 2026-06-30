@@ -47,6 +47,14 @@ internal sealed class NatsJetStreamBus : IJetStreamPublisher, IJetStreamConsumer
             opts: new NatsJSPubOpts { MsgId = messageId },
             cancellationToken: cancellationToken);
 
+        // A duplicate is the success case for an idempotent retry: the message is already persisted,
+        // so treat it as a no-op rather than letting EnsureSuccess() throw NatsJSDuplicateMessageException.
+        if (ack.Duplicate)
+        {
+            _logger.LogDebug("JetStream de-duplicated publish to {Subject} with MsgId {MsgId} (already stored)", subject, messageId);
+            return;
+        }
+
         ack.EnsureSuccess();
         _logger.LogDebug("Published JetStream message to {Subject} with MsgId {MsgId}", subject, messageId);
     }
