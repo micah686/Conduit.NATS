@@ -1,5 +1,6 @@
 using Conduit.NATS.IntegrationTests.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
+using NATS.Client.Core;
 using Shouldly;
 using TUnit.Core;
 
@@ -19,20 +20,14 @@ public sealed class RequestReplyTests
         await using var sp = _nats.BuildProvider();
         var bus = sp.GetRequiredService<IMessageBus>();
 
+        // SubscribeAsync establishes the subscription before returning, so the responder is live
+        // up front and a single request (same connection → ordered) gets answered.
         await using var sub = await bus.SubscribeAsync<PingMsg>(
             "rpc.ping",
             async ctx => await ctx.RespondAsync(new PongMsg($"{ctx.Message.Value}-pong")),
             cancellationToken: cancellationToken);
 
-        // Core NATS subscriptions are not persisted, so poll until the responder is live.
-        PongMsg? response = null;
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
-        while (DateTime.UtcNow < deadline && response is null)
-        {
-            response = await bus.RequestAsync<PingMsg, PongMsg>("rpc.ping", new PingMsg("hi"), TimeSpan.FromSeconds(2), cancellationToken);
-            if (response is null)
-                await Task.Delay(200, cancellationToken);
-        }
+        var response = await bus.RequestAsync<PingMsg, PongMsg>("rpc.ping", new PingMsg("hi"), TimeSpan.FromSeconds(10), cancellationToken);
 
         response.ShouldNotBeNull();
         response!.Value.ShouldBe("hi-pong");
@@ -40,12 +35,13 @@ public sealed class RequestReplyTests
 
     [Test]
     [Timeout(60_000)]
-    public async Task Request_With_No_Responder_Returns_Default(CancellationToken cancellationToken)
+    public async Task Request_With_No_Responder_Throws(CancellationToken cancellationToken)
     {
         await using var sp = _nats.BuildProvider();
         var bus = sp.GetRequiredService<IMessageBus>();
 
-        var response = await bus.RequestAsync<PingMsg, PongMsg>("rpc.no.responder", new PingMsg("x"), TimeSpan.FromSeconds(2), cancellationToken);
-        response.ShouldBeNull();
+        // No responder must surface as an exception (not a null result) so callers can retry on it.
+        await Should.ThrowAsync<NatsNoRespondersException>(async () =>
+            await bus.RequestAsync<PingMsg, PongMsg>("rpc.no.responder", new PingMsg("x"), TimeSpan.FromSeconds(2), cancellationToken));
     }
 }

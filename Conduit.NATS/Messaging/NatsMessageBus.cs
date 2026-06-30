@@ -38,7 +38,7 @@ internal sealed class NatsMessageBus : IMessageBus, IAsyncDisposable
         await _connection.PublishAsync(subject, message, headers: natsHeaders, cancellationToken: cancellationToken);
     }
 
-    public Task<ISubscription> SubscribeAsync<T>(
+    public async Task<ISubscription> SubscribeAsync<T>(
         string subject,
         Func<IMessageContext<T>, Task> handler,
         string? queueGroup = null,
@@ -50,11 +50,16 @@ internal sealed class NatsMessageBus : IMessageBus, IAsyncDisposable
 
         _logger.LogInformation("Subscribing to {Subject} (queueGroup: {QueueGroup})", subject, queueGroup ?? "<none>");
 
+        // Establish the subscription before returning so responders are registered up front. A lazy
+        // SubscribeAsync(...) IAsyncEnumerable only sends the SUB once enumeration starts, which leaves
+        // a startup window where request/reply callers see "no responders".
+        var sub = await _connection.SubscribeCoreAsync<T>(subject, queueGroup: queueGroup, cancellationToken: token);
+
         var task = Task.Run(async () =>
         {
             try
             {
-                await foreach (var msg in _connection.SubscribeAsync<T>(subject, queueGroup: queueGroup, cancellationToken: token))
+                await foreach (var msg in sub.Msgs.ReadAllAsync(token))
                 {
                     try
                     {
@@ -75,10 +80,14 @@ internal sealed class NatsMessageBus : IMessageBus, IAsyncDisposable
             {
                 _logger.LogError(ex, "Subscription loop for {Subject} terminated unexpectedly", subject);
             }
+            finally
+            {
+                await sub.DisposeAsync();
+            }
         }, token);
 
         _subscriptions[id] = (task, linkedCts);
-        return Task.FromResult<ISubscription>(new SubscriptionHandle(id, StopSubscriptionAsync));
+        return new SubscriptionHandle(id, StopSubscriptionAsync);
     }
 
     private async Task StopSubscriptionAsync(Guid id, CancellationToken cancellationToken)
@@ -108,19 +117,16 @@ internal sealed class NatsMessageBus : IMessageBus, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var effectiveTimeout = timeout > TimeSpan.Zero ? timeout : _defaultRequestTimeout;
-        try
-        {
-            var reply = await _connection.RequestAsync<TRequest, TResponse>(
-                subject,
-                request,
-                replyOpts: new NatsSubOpts { Timeout = effectiveTimeout },
-                cancellationToken: cancellationToken);
-            return reply.Data;
-        }
-        catch (NatsNoRespondersException)
-        {
-            return default;
-        }
+
+        // Deliberately do NOT swallow NatsNoRespondersException/timeouts into a null result: callers
+        // (e.g. startup hydration) retry on exceptions to ride out a responder that isn't up yet.
+        // Returning null here would turn a transient "not ready" into an immediate, unretried failure.
+        var reply = await _connection.RequestAsync<TRequest, TResponse>(
+            subject,
+            request,
+            replyOpts: new NatsSubOpts { Timeout = effectiveTimeout },
+            cancellationToken: cancellationToken);
+        return reply.Data;
     }
 
     public async ValueTask DisposeAsync()
